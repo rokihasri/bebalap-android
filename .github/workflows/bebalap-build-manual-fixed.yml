@@ -1,0 +1,230 @@
+name: Bebalap Android - Manual Debug APK & Signed AAB
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version name'
+        required: true
+        default: '1.0.0'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.13'
+  ANDROID_API: '36'
+  SOURCE_ZIP: 'bebalap-android-webview-icon-spaced.zip'
+  BEBALAP_VERSION_NAME: ${{ inputs.version_name }}
+
+jobs:
+  build:
+    name: Build Debug APK & Signed Play Store AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Extract WebView project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$SOURCE_ZIP" || {
+            echo "Source ZIP tidak ditemukan: $SOURCE_ZIP"
+            echo "Isi repository:"
+            ls -la
+            exit 1
+          }
+
+          EXTRACT_DIR="$RUNNER_TEMP/bebalap-source"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q -o "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+
+          SETTINGS_FILE="$(find "$EXTRACT_DIR" -maxdepth 4 -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)"
+
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "settings.gradle/settings.gradle.kts tidak ditemukan setelah ZIP diekstrak."
+            find "$EXTRACT_DIR" -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          test -f "$PROJECT_DIR/app/build.gradle" -o -f "$PROJECT_DIR/app/build.gradle.kts" || {
+            echo "app/build.gradle tidak ditemukan di $PROJECT_DIR"
+            exit 1
+          }
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project Gradle ditemukan: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 2 -type f | sort | head -80
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER=""
+          for candidate in \
+            "${ANDROID_SDK_ROOT:-}/cmdline-tools/latest/bin/sdkmanager" \
+            "${ANDROID_HOME:-}/cmdline-tools/latest/bin/sdkmanager" \
+            "$(command -v sdkmanager 2>/dev/null || true)"; do
+            if [[ -n "$candidate" && -x "$candidate" ]]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "sdkmanager tidak ditemukan pada GitHub runner."
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-${ANDROID_API}"
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Verify project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          echo "Gradle project: $PWD"
+          java -version
+          gradle --version
+
+          grep -q "applicationId 'app.bebalap.id'" app/build.gradle
+          grep -q "compileSdk 36" app/build.gradle
+          grep -q "targetSdk 36" app/build.gradle
+
+          echo "Package app.bebalap.id dan SDK 36 terverifikasi."
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          gradle --no-daemon --stacktrace --warning-mode all :app:assembleDebug
+
+          DEBUG_APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$DEBUG_APK" -a -f "$DEBUG_APK" || {
+            echo "Debug APK tidak ditemukan."
+            exit 1
+          }
+
+          mkdir -p "$RUNNER_TEMP/bebalap-artifacts"
+          cp "$DEBUG_APK" "$RUNNER_TEMP/bebalap-artifacts/Bebalap-${BEBALAP_VERSION_NAME}-debug.apk"
+
+          echo "Debug APK berhasil: $DEBUG_APK"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bebalap-debug-apk-${{ env.BEBALAP_VERSION_NAME }}
+          path: ${{ runner.temp }}/bebalap-artifacts/Bebalap-${{ env.BEBALAP_VERSION_NAME }}-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Prepare Play Store signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${KEYSTORE_BASE64:-}" ]] || { echo "ANDROID_KEYSTORE_BASE64 belum dibuat."; exit 1; }
+          [[ -n "${KEYSTORE_PASSWORD:-}" ]] || { echo "ANDROID_KEYSTORE_PASSWORD belum dibuat."; exit 1; }
+          [[ -n "${KEY_ALIAS:-}" ]] || { echo "ANDROID_KEY_ALIAS belum dibuat."; exit 1; }
+          [[ -n "${KEY_PASSWORD:-}" ]] || { echo "ANDROID_KEY_PASSWORD belum dibuat."; exit 1; }
+
+          KEYSTORE_PATH="$RUNNER_TEMP/bebalap-upload.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+
+          keytool -list \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+
+          {
+            echo "BEBALAP_KEYSTORE_PATH=$KEYSTORE_PATH"
+            echo "BEBALAP_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "BEBALAP_KEY_ALIAS=$KEY_ALIAS"
+            echo "BEBALAP_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+          echo "Keystore Play Store valid."
+
+      - name: Build Signed Play Store AAB
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          gradle --no-daemon --stacktrace --warning-mode all :app:bundleRelease
+
+          AAB="$(find app/build/outputs/bundle/release -maxdepth 1 -type f -name '*.aab' -print -quit)"
+          test -n "$AAB" -a -f "$AAB" || {
+            echo "Release AAB tidak ditemukan."
+            exit 1
+          }
+
+          echo "AAB berhasil dibuat: $AAB"
+
+      - name: Verify AAB signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          AAB="$(find app/build/outputs/bundle/release -maxdepth 1 -type f -name '*.aab' -print -quit)"
+          test -n "$AAB" -a -f "$AAB"
+
+          jarsigner -verify -verbose -certs "$AAB" >/dev/null
+
+          echo "AAB signature VALID."
+
+          cp "$AAB" "$RUNNER_TEMP/bebalap-artifacts/Bebalap-${BEBALAP_VERSION_NAME}-playstore-signed.aab"
+
+      - name: Upload Signed Play Store AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bebalap-signed-playstore-aab-${{ env.BEBALAP_VERSION_NAME }}
+          path: ${{ runner.temp }}/bebalap-artifacts/Bebalap-${{ env.BEBALAP_VERSION_NAME }}-playstore-signed.aab
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo "## Bebalap Android Build Selesai"
+            echo ""
+            echo "- Package: \`app.bebalap.id\`"
+            echo "- Version: \`${BEBALAP_VERSION_NAME}\`"
+            echo "- Target SDK: \`${ANDROID_API}\`"
+            echo "- Debug APK: **BERHASIL**"
+            echo "- Play Store AAB: **SIGNED & VERIFIED**"
+          } >> "$GITHUB_STEP_SUMMARY"
